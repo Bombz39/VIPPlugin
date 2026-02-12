@@ -17,5 +17,5 @@ If you have issues please join the discord https://discord.gg/wARxNSutRk
 
 Make a ticket and we will be happy to help!
 
-Always happy to help :)
+Always happy to help :) 
  
