@@ -1,0 +1,431 @@
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
+
+namespace Oxide.Plugins
+{
+    [Info("VIPPlugin", "Bombz", "0.5.3")]
+    public class VIPPlugin : RustPlugin
+    {
+        private StoredData data;
+        private Dictionary<string, Package> packages = new Dictionary<string, Package>();
+
+        private string grantWebhook;
+        private string removeWebhook;
+        private string expireWebhook;
+        private string dailyRPWebhook;
+
+        class StoredData
+        {
+            public Dictionary<string, VIPInfo> VIPs = new Dictionary<string, VIPInfo>();
+        }
+
+        class VIPInfo
+        {
+            public string Package;
+            public long Expire;
+            public long LastDailyRP;
+        }
+
+        class Package
+        {
+            public int RP;
+            public int Days;
+        }
+
+        // -------------------------
+        // CONFIG
+        // -------------------------
+        protected override void LoadDefaultConfig()
+        {
+            Config["Packages"] = new Dictionary<string, object>
+            {
+                ["Bronze"] = new Dictionary<string, object> { ["RP"] = 200, ["Days"] = 30 },
+                ["Silver"] = new Dictionary<string, object> { ["RP"] = 500, ["Days"] = 30 },
+                ["Gold"] = new Dictionary<string, object> { ["RP"] = 1000, ["Days"] = 30 }
+            };
+
+            Config["Discord"] = new Dictionary<string, object>
+            {
+                ["GrantWebhook"] = "",
+                ["RemoveWebhook"] = "",
+                ["ExpireWebhook"] = "",
+                ["DailyRPWebhook"] = ""
+            };
+        }
+
+        void LoadPackages()
+        {
+            var raw = Config["Packages"] as Dictionary<string, object>;
+            packages.Clear();
+
+            if (raw == null)
+            {
+                Puts("[VIP] Packages config missing or invalid.");
+                return;
+            }
+
+            foreach (var entry in raw)
+            {
+                var dict = entry.Value as Dictionary<string, object>;
+                if (dict == null)
+                    continue;
+
+                packages[entry.Key] = new Package
+                {
+                    RP = Convert.ToInt32(dict["RP"]),
+                    Days = Convert.ToInt32(dict["Days"])
+                };
+            }
+        }
+
+        void LoadDiscordConfig()
+        {
+            var raw = Config["Discord"] as Dictionary<string, object>;
+            if (raw == null)
+            {
+                Puts("[VIP] Discord config missing or invalid.");
+                grantWebhook = removeWebhook = expireWebhook = dailyRPWebhook = "";
+                return;
+            }
+
+            grantWebhook = raw["GrantWebhook"]?.ToString() ?? "";
+            removeWebhook = raw["RemoveWebhook"]?.ToString() ?? "";
+            expireWebhook = raw["ExpireWebhook"]?.ToString() ?? "";
+            dailyRPWebhook = raw["DailyRPWebhook"]?.ToString() ?? "";
+        }
+
+        // -------------------------
+        // INIT + DATA
+        // -------------------------
+        void Init()
+        {
+            LoadPackages();
+            LoadDiscordConfig();
+            LoadData();
+            StartHourlyTimer();
+            Puts("VIPPlugin v0.5.3 loaded (instant RP + daily RP + expiration + Discord logging).");
+        }
+
+        void LoadData()
+        {
+            data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name);
+            if (data.VIPs == null)
+                data.VIPs = new Dictionary<string, VIPInfo>();
+        }
+
+        void SaveData()
+        {
+            Interface.Oxide.DataFileSystem.WriteObject(Name, data);
+        }
+
+        // -------------------------
+        // HOURLY TIMER
+        // -------------------------
+        void StartHourlyTimer()
+        {
+            timer.Every(3600f, () =>
+            {
+                ProcessExpirations();
+                ProcessDailyRP();
+            });
+        }
+
+        // -------------------------
+        // EXPIRATION
+        // -------------------------
+        void ProcessExpirations()
+        {
+            long now = Now();
+            List<string> removeList = new List<string>();
+
+            foreach (var entry in data.VIPs)
+            {
+                if (entry.Value.Expire < now)
+                    removeList.Add(entry.Key);
+            }
+
+            foreach (var id in removeList)
+            {
+                var info = data.VIPs[id];
+                string pkg = info.Package;
+                data.VIPs.Remove(id);
+                Puts($"[VIP] Removed expired VIP from {id} ({pkg})");
+                SendExpireLog(id, pkg, info.Expire);
+            }
+
+            if (removeList.Count > 0)
+                SaveData();
+        }
+
+        // -------------------------
+        // DAILY RP
+        // -------------------------
+        void ProcessDailyRP()
+        {
+            long now = Now();
+
+            foreach (var entry in data.VIPs)
+            {
+                var info = entry.Value;
+
+                if (!packages.ContainsKey(info.Package))
+                    continue;
+
+                if (now - info.LastDailyRP < 86400)
+                    continue;
+
+                var pkg = packages[info.Package];
+
+                var sr = plugins.Find("ServerRewards");
+                if (sr != null)
+                    sr.Call("AddPoints", entry.Key, pkg.RP);
+
+                info.LastDailyRP = now;
+                Puts($"[VIP] Gave {pkg.RP} daily RP to {entry.Key} ({info.Package})");
+                SendDailyRPLog(entry.Key, info.Package, pkg.RP);
+            }
+
+            SaveData();
+        }
+
+        // -------------------------
+        // COMMANDS
+        // -------------------------
+        [ChatCommand("vip")]
+        void CmdVIP(BasePlayer player, string cmd, string[] args)
+        {
+            if (!player.IsAdmin)
+            {
+                player.ChatMessage("You are not an admin.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage("Usage: /vip give/take/check");
+                return;
+            }
+
+            string sub = args[0].ToLower();
+
+            if (sub == "give" && args.Length == 3)
+                GiveVIP(player, args[1], args[2]);
+            else if (sub == "take" && args.Length == 2)
+                TakeVIP(player, args[1]);
+            else if (sub == "check" && args.Length == 2)
+                CheckVIP(player, args[1]);
+            else
+                player.ChatMessage("Invalid syntax.");
+        }
+
+        // -------------------------
+        // VIP LOGIC
+        // -------------------------
+        void GiveVIP(BasePlayer admin, string targetName, string pkg)
+        {
+            BasePlayer t = FindPlayer(targetName);
+            if (t == null) { admin.ChatMessage("Player not found."); return; }
+
+            if (!packages.ContainsKey(pkg))
+            {
+                admin.ChatMessage("Invalid package.");
+                return;
+            }
+
+            var p = packages[pkg];
+            long now = Now();
+            long exp = now + (p.Days * 86400);
+
+            data.VIPs[t.UserIDString] = new VIPInfo
+            {
+                Package = pkg,
+                Expire = exp,
+                LastDailyRP = 0
+            };
+
+            SaveData();
+
+            admin.ChatMessage($"Gave {t.displayName} VIP {pkg} (expires {UnixToDate(exp)})");
+            t.ChatMessage($"You received VIP {pkg} for {p.Days} days!");
+
+            // -------------------------
+            // INSTANT RP ON VIP GRANT
+            // -------------------------
+            var sr = plugins.Find("ServerRewards");
+            if (sr != null)
+            {
+                sr.Call("AddPoints", t.UserIDString, p.RP);
+                Puts($"[VIP] Gave {p.RP} INSTANT RP to {t.displayName} ({pkg})");
+
+                data.VIPs[t.UserIDString].LastDailyRP = now;
+                SaveData();
+
+                SendInstantRPLog(t.UserIDString, t.displayName, pkg, p.RP);
+            }
+
+            SendGrantLog(admin.UserIDString, admin.displayName, t.UserIDString, t.displayName, pkg, p.Days, exp);
+        }
+
+        void TakeVIP(BasePlayer admin, string targetName)
+        {
+            BasePlayer t = FindPlayer(targetName);
+            if (t == null) { admin.ChatMessage("Player not found."); return; }
+
+            if (!data.VIPs.ContainsKey(t.UserIDString))
+            {
+                admin.ChatMessage("Player has no VIP.");
+                return;
+            }
+
+            string pkg = data.VIPs[t.UserIDString].Package;
+            data.VIPs.Remove(t.UserIDString);
+            SaveData();
+
+            admin.ChatMessage($"Removed VIP from {t.displayName}");
+            t.ChatMessage("Your VIP has been removed.");
+
+            SendRemoveLog(admin.UserIDString, admin.displayName, t.UserIDString, t.displayName, pkg);
+        }
+
+        void CheckVIP(BasePlayer admin, string targetName)
+        {
+            BasePlayer t = FindPlayer(targetName);
+            if (t == null) { admin.ChatMessage("Player not found."); return; }
+
+            if (!data.VIPs.ContainsKey(t.UserIDString))
+            {
+                admin.ChatMessage("Player has no VIP.");
+                return;
+            }
+
+            var info = data.VIPs[t.UserIDString];
+            admin.ChatMessage($"{t.displayName} has VIP {info.Package} until {UnixToDate(info.Expire)}");
+        }
+
+        // -------------------------
+        // DISCORD LOGGING
+        // -------------------------
+        void SendInstantRPLog(string userId, string userName, string pkg, int amount)
+        {
+            if (string.IsNullOrEmpty(grantWebhook))
+                return;
+
+            string title = "VIP Initial RP Granted";
+            string desc =
+                $"**Player:** {userName} (`{userId}`)\n" +
+                $"**Package:** {pkg}\n" +
+                $"**Instant RP:** {amount}";
+
+            SendDiscordEmbed(grantWebhook, title, desc);
+        }
+
+        void SendGrantLog(string adminId, string adminName, string userId, string userName, string pkg, int days, long expire)
+        {
+            if (string.IsNullOrEmpty(grantWebhook))
+                return;
+
+            string title = "VIP Granted";
+            string desc =
+                $"**Player:** {userName} (`{userId}`)\n" +
+                $"**Package:** {pkg}\n" +
+                $"**Duration:** {days} days\n" +
+                $"**Expires:** {UnixToDate(expire)}\n" +
+                $"**Admin:** {adminName} (`{adminId}`)";
+
+            SendDiscordEmbed(grantWebhook, title, desc);
+        }
+
+        void SendRemoveLog(string adminId, string adminName, string userId, string userName, string pkg)
+        {
+            if (string.IsNullOrEmpty(removeWebhook))
+                return;
+
+            string title = "VIP Removed";
+            string desc =
+                $"**Player:** {userName} (`{userId}`)\n" +
+                $"**Package:** {pkg}\n" +
+                $"**Admin:** {adminName} (`{adminId}`)";
+
+            SendDiscordEmbed(removeWebhook, title, desc);
+        }
+
+        void SendExpireLog(string userId, string pkg, long expire)
+        {
+            if (string.IsNullOrEmpty(expireWebhook))
+                return;
+
+            string title = "VIP Expired";
+            string desc =
+                $"**Player ID:** `{userId}`\n" +
+                $"**Package:** {pkg}\n" +
+                $"**Expired At:** {UnixToDate(expire)}";
+
+            SendDiscordEmbed(expireWebhook, title, desc);
+        }
+
+        void SendDailyRPLog(string userId, string pkg, int amount)
+        {
+            if (string.IsNullOrEmpty(dailyRPWebhook))
+                return;
+
+            string title = "Daily VIP RP Granted";
+            string desc =
+                $"**Player ID:** `{userId}`\n" +
+                $"**Package:** {pkg}\n" +
+                $"**RP Amount:** {amount}";
+
+            SendDiscordEmbed(dailyRPWebhook, title, desc);
+        }
+
+        void SendDiscordEmbed(string webhook, string title, string description)
+        {
+            var payload = new
+            {
+                embeds = new[]
+                {
+                    new
+                    {
+                        title = title,
+                        description = description,
+                        color = 0xde8732,
+                        footer = new
+                        {
+                            text = "Bombz Development"
+                        },
+                        timestamp = DateTime.UtcNow.ToString("o")
+                    }
+                }
+            };
+
+            string json = JsonConvert.SerializeObject(payload);
+
+            webrequest.Enqueue(webhook, json, (code, response) =>
+            {
+                if (code != 204 && code != 200)
+                    Puts($"[VIP] Discord webhook error ({code}): {response}");
+            }, this, RequestMethod.POST, new Dictionary<string, string>
+            {
+                ["Content-Type"] = "application/json"
+            });
+        }
+
+        // -------------------------
+        // HELPERS
+        // -------------------------
+        BasePlayer FindPlayer(string name)
+        {
+            foreach (var p in BasePlayer.activePlayerList)
+                if (p.displayName.ToLower().Contains(name.ToLower()))
+                    return p;
+            return null;
+        }
+
+        long Now() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        string UnixToDate(long ts) =>
+            DateTimeOffset.FromUnixTimeSeconds(ts).UtcDateTime.ToString("yyyy-MM-dd HH:mm");
+    }
+}
